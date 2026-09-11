@@ -121,6 +121,7 @@ def init_db():
         ("violation_count", "INTEGER DEFAULT 0"),
         ("camera_granted", "BOOLEAN DEFAULT FALSE" if DB_URL else "INTEGER DEFAULT 0"),
         ("login_used_at", "TEXT"),
+        ("evaluation_status", "TEXT DEFAULT 'pending'"),
     ]
     for col, typ in migrations:
         try:
@@ -201,7 +202,7 @@ async def create_candidate(req: Request):
 @app.get("/api/admin/sessions")
 def admin_sessions(req: Request):
     require_admin(req); c=db()
-    rows=c.execute("SELECT id,candidate_name,email,login,token,started_at,submitted_at,score,created_at FROM react_sessions ORDER BY id DESC").fetchall()
+    rows=c.execute("SELECT id,candidate_name,email,login,token,started_at,submitted_at,score,COALESCE(evaluation_status, CASE WHEN submitted_at IS NULL THEN 'in_progress' ELSE 'evaluated' END) AS evaluation_status,created_at FROM react_sessions ORDER BY id DESC").fetchall()
     c.close(); return [rowdict(x) for x in rows]
 
 @app.get("/api/admin/session/{token}")
@@ -342,8 +343,8 @@ async def submit(req:Request):
     score,static_analysis=compute_score(answers,code,tests)
     tests=dict(tests or {}); tests["server_static"]=static_analysis
     c=db(); c.execute(f"""UPDATE react_sessions SET answers={PH},code={PH},coding_tests={PH},
-             score={PH},submitted_at={PH} WHERE token={PH}""",
-             (ph_json(answers),code,ph_json(tests),score,now_iso(),token))
+             score={PH},evaluation_status={PH},submitted_at={PH} WHERE token={PH}""",
+             (ph_json(answers),code,ph_json(tests),score,'evaluated',now_iso(),token))
     c.commit(); c.close()
     return {"ok":True,"score":score}
 
