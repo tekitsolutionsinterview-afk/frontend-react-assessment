@@ -120,6 +120,7 @@ def init_db():
         ("proctor_events", "JSONB DEFAULT '[]'::jsonb" if DB_URL else "TEXT DEFAULT '[]'"),
         ("violation_count", "INTEGER DEFAULT 0"),
         ("camera_granted", "BOOLEAN DEFAULT FALSE" if DB_URL else "INTEGER DEFAULT 0"),
+        ("login_used_at", "TEXT"),
     ]
     for col, typ in migrations:
         try:
@@ -191,7 +192,7 @@ async def create_candidate(req: Request):
     pwd=secrets.token_urlsafe(6)
     token=secrets.token_urlsafe(18)
     c=db()
-    vals=(name,email,login,hash_pw(pwd),token,ph_json({}),"",ph_json({}),ph_json([]),ph_json([]),0,0,now_iso())
+    vals=(name,email,login,hash_pw(pwd),token,ph_json({}),"",ph_json({}),ph_json([]),ph_json([]),0,False,now_iso())
     c.execute(f"""INSERT INTO react_sessions(candidate_name,email,login,password_hash,token,answers,code,coding_tests,events,proctor_events,violation_count,camera_granted,created_at)
                   VALUES ({','.join([PH]*13)})""", vals)
     c.commit(); c.close()
@@ -215,11 +216,27 @@ def admin_detail(token: str, req: Request):
 @app.post("/api/candidate/login")
 async def candidate_login(req: Request):
     d=await req.json(); login=str(d.get("login","")).strip(); password=str(d.get("password",""))
-    c=db(); r=c.execute(f"SELECT * FROM react_sessions WHERE login={PH}",(login,)).fetchone(); c.close()
-    if not r or not secrets.compare_digest(hash_pw(password),r["password_hash"]):
-        raise HTTPException(401,"Invalid candidate credentials")
-    if r["submitted_at"]: raise HTTPException(409,"Assessment already submitted")
-    return {"token":r["token"],"name":r["candidate_name"],"started_at":r["started_at"]}
+    c=db()
+    try:
+        if DB_URL:
+            c.execute("BEGIN")
+            r=c.execute(f"SELECT * FROM react_sessions WHERE login={PH} FOR UPDATE",(login,)).fetchone()
+        else:
+            c.execute("BEGIN IMMEDIATE")
+            r=c.execute(f"SELECT * FROM react_sessions WHERE login={PH}",(login,)).fetchone()
+        r = rowdict(r) if r else None
+        if not r or not secrets.compare_digest(hash_pw(password),r["password_hash"]):
+            c.rollback(); raise HTTPException(401,"Invalid candidate credentials")
+        if r["submitted_at"]:
+            c.rollback(); raise HTTPException(409,"You have already taken the test")
+        if r.get("login_used_at"):
+            c.rollback(); raise HTTPException(409,"You have already taken the test")
+        used=now_iso()
+        c.execute(f"UPDATE react_sessions SET login_used_at={PH} WHERE id={PH}",(used,r["id"]))
+        c.commit()
+        return {"token":r["token"],"name":r["candidate_name"],"started_at":r["started_at"],"login_used_at":used}
+    finally:
+        c.close()
 
 @app.post("/api/candidate/start/{token}")
 async def start(token:str, req:Request):
