@@ -29,6 +29,8 @@ else:
         return c
     PH = "?"
 
+SESSIONS_TABLE = "react_sessions"
+
 app = FastAPI(title="React Frontend Assessment Platform", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
@@ -74,14 +76,13 @@ def now_iso():
 def init_db():
     c = db()
     if DB_URL:
-        # Create the current schema for a fresh database.
-        c.execute("""CREATE TABLE IF NOT EXISTS sessions(
+        c.execute("""CREATE TABLE IF NOT EXISTS react_sessions(
             id BIGSERIAL PRIMARY KEY,
-            candidate_name TEXT,
-            email TEXT,
-            login TEXT,
-            password_hash TEXT,
-            token TEXT UNIQUE,
+            candidate_name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            login TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
             answers JSONB DEFAULT '{}'::jsonb,
             code TEXT DEFAULT '',
             coding_tests JSONB DEFAULT '{}'::jsonb,
@@ -89,75 +90,10 @@ def init_db():
             submitted_at TEXT,
             score INTEGER DEFAULT 0,
             events JSONB DEFAULT '[]'::jsonb,
-            created_at TEXT
+            created_at TEXT NOT NULL
         )""")
-
-        # Backward-compatible migration for the older Python assessment DB.
-        # The old table used: candidate, login_id, section_scores, feedback, sql,
-        # time_taken_seconds and authenticated_at.  Do not delete or rewrite old
-        # attempts; add the columns needed by this React assessment and backfill
-        # them from the legacy columns.
-        cols = {r[0] for r in c.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name='sessions'"
-        ).fetchall()}
-        additions = {
-            "candidate_name": "TEXT",
-            "email": "TEXT",
-            "login": "TEXT",
-            "password_hash": "TEXT",
-            "coding_tests": "JSONB DEFAULT '{}'::jsonb",
-            "created_at": "TEXT",
-        }
-        for name, typ in additions.items():
-            if name not in cols:
-                c.execute(f"ALTER TABLE sessions ADD COLUMN {name} {typ}")
-
-        # The legacy DB has candidate/login_id but no candidate_name/email/login.
-        # Use deterministic legacy values so existing rows remain readable while
-        # newly created React candidates use the new fields normally.
-        cols = {r[0] for r in c.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name='sessions'"
-        ).fetchall()}
-        if "candidate" in cols:
-            c.execute("""UPDATE sessions
-                         SET candidate_name = COALESCE(NULLIF(candidate_name,''), candidate)
-                         WHERE candidate_name IS NULL OR candidate_name=''""")
-        c.execute("""UPDATE sessions
-                     SET email = COALESCE(NULLIF(email,''), 'legacy-' || id::text || '@invalid.local')
-                     WHERE email IS NULL OR email=''""")
-        if "login_id" in cols:
-            c.execute("""UPDATE sessions
-                         SET login = COALESCE(NULLIF(login,''), NULLIF(login_id,''), 'LEGACY-' || id::text)
-                         WHERE login IS NULL OR login=''""")
-        else:
-            c.execute("""UPDATE sessions
-                         SET login = COALESCE(NULLIF(login,''), 'LEGACY-' || id::text)
-                         WHERE login IS NULL OR login=''""")
-        if "password_hash" in cols:
-            c.execute("""UPDATE sessions
-                         SET password_hash = COALESCE(password_hash,'')
-                         WHERE password_hash IS NULL""")
-        c.execute("""UPDATE sessions
-                     SET coding_tests = COALESCE(coding_tests, '{}'::jsonb)
-                     WHERE coding_tests IS NULL""")
-        if "started_at" in cols:
-            c.execute("""UPDATE sessions
-                         SET created_at = COALESCE(created_at, started_at, NOW()::text)
-                         WHERE created_at IS NULL OR created_at=''""")
-        else:
-            c.execute("""UPDATE sessions SET created_at = COALESCE(created_at, NOW()::text)
-                         WHERE created_at IS NULL OR created_at=''""")
-
-        # Only add a unique login index if the existing legacy data does not contain
-        # duplicates. This avoids making migration fail on old records.
-        dup = c.execute("""SELECT 1 FROM sessions WHERE login IS NOT NULL
-                           GROUP BY login HAVING COUNT(*) > 1 LIMIT 1""").fetchone()
-        if not dup:
-            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS sessions_login_unique ON sessions(login)")
     else:
-        c.execute("""CREATE TABLE IF NOT EXISTS sessions(
+        c.execute("""CREATE TABLE IF NOT EXISTS react_sessions(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             candidate_name TEXT NOT NULL,
             email TEXT NOT NULL,
@@ -173,24 +109,6 @@ def init_db():
             events TEXT DEFAULT '[]',
             created_at TEXT NOT NULL
         )""")
-        # Lightweight SQLite migration for older local copies.
-        cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)").fetchall()}
-        for name, typ in {"candidate_name":"TEXT", "email":"TEXT", "login":"TEXT",
-                          "password_hash":"TEXT", "coding_tests":"TEXT", "created_at":"TEXT"}.items():
-            if name not in cols:
-                c.execute(f"ALTER TABLE sessions ADD COLUMN {name} {typ}")
-        c.execute("""UPDATE sessions SET candidate_name=COALESCE(NULLIF(candidate_name,''), candidate, 'Legacy Candidate')
-                     WHERE candidate_name IS NULL OR candidate_name=''""")
-        c.execute("""UPDATE sessions SET email=COALESCE(NULLIF(email,''), 'legacy-' || id || '@invalid.local')
-                     WHERE email IS NULL OR email=''""")
-        c.execute("""UPDATE sessions SET login=COALESCE(NULLIF(login,''), login_id, 'LEGACY-' || id)
-                     WHERE login IS NULL OR login=''""")
-        c.execute("""UPDATE sessions SET password_hash=COALESCE(password_hash,'')
-                     WHERE password_hash IS NULL""")
-        c.execute("""UPDATE sessions SET coding_tests=COALESCE(coding_tests,'{}')
-                     WHERE coding_tests IS NULL OR coding_tests=''""")
-        c.execute("""UPDATE sessions SET created_at=COALESCE(NULLIF(created_at,''), started_at, CURRENT_TIMESTAMP)
-                     WHERE created_at IS NULL OR created_at=''""")
     c.commit(); c.close()
 
 def ph_json(x):
@@ -201,7 +119,7 @@ def rowdict(r):
     return r
 
 def get_session(token):
-    c=db(); r=c.execute(f"SELECT * FROM sessions WHERE token={PH}", (token,)).fetchone(); c.close()
+    c=db(); r=c.execute(f"SELECT * FROM react_sessions WHERE token={PH}", (token,)).fetchone(); c.close()
     if not r: raise HTTPException(404,"Assessment not found")
     return rowdict(r)
 
@@ -253,7 +171,7 @@ async def create_candidate(req: Request):
     token=secrets.token_urlsafe(18)
     c=db()
     vals=(name,email,login,hash_pw(pwd),token,ph_json({}),"",ph_json({}),ph_json([]),now_iso())
-    c.execute(f"""INSERT INTO sessions(candidate_name,email,login,password_hash,token,answers,code,coding_tests,events,created_at)
+    c.execute(f"""INSERT INTO react_sessions(candidate_name,email,login,password_hash,token,answers,code,coding_tests,events,created_at)
                   VALUES ({','.join([PH]*10)})""", vals)
     c.commit(); c.close()
     return {"login":login,"password":pwd,"token":token}
@@ -261,7 +179,7 @@ async def create_candidate(req: Request):
 @app.get("/api/admin/sessions")
 def admin_sessions(req: Request):
     require_admin(req); c=db()
-    rows=c.execute("SELECT id,candidate_name,email,login,token,started_at,submitted_at,score,created_at FROM sessions ORDER BY id DESC").fetchall()
+    rows=c.execute("SELECT id,candidate_name,email,login,token,started_at,submitted_at,score,created_at FROM react_sessions ORDER BY id DESC").fetchall()
     c.close(); return [rowdict(x) for x in rows]
 
 @app.get("/api/admin/session/{token}")
@@ -276,7 +194,7 @@ def admin_detail(token: str, req: Request):
 @app.post("/api/candidate/login")
 async def candidate_login(req: Request):
     d=await req.json(); login=str(d.get("login","")).strip(); password=str(d.get("password",""))
-    c=db(); r=c.execute(f"SELECT * FROM sessions WHERE login={PH}",(login,)).fetchone(); c.close()
+    c=db(); r=c.execute(f"SELECT * FROM react_sessions WHERE login={PH}",(login,)).fetchone(); c.close()
     if not r or not secrets.compare_digest(hash_pw(password),r["password_hash"]):
         raise HTTPException(401,"Invalid candidate credentials")
     if r["submitted_at"]: raise HTTPException(409,"Assessment already submitted")
@@ -287,7 +205,7 @@ def start(token:str):
     r=get_session(token)
     if r["submitted_at"]: raise HTTPException(409,"Assessment already submitted")
     if not r["started_at"]:
-        started=now_iso(); c=db(); c.execute(f"UPDATE sessions SET started_at={PH} WHERE token={PH}",(started,token)); c.commit(); c.close()
+        started=now_iso(); c=db(); c.execute(f"UPDATE react_sessions SET started_at={PH} WHERE token={PH}",(started,token)); c.commit(); c.close()
         return {"started_at":started,"duration_seconds":2700}
     return {"started_at":r["started_at"],"duration_seconds":2700}
 
@@ -297,7 +215,7 @@ async def autosave(req:Request):
     if r["submitted_at"]: return {"ok":False,"submitted":True}
     answers=d.get("answers",{}); code=d.get("code",""); events=d.get("events",[])
     c=db()
-    c.execute(f"UPDATE sessions SET answers={PH},code={PH},events={PH} WHERE token={PH}",
+    c.execute(f"UPDATE react_sessions SET answers={PH},code={PH},events={PH} WHERE token={PH}",
               (ph_json(answers),code,ph_json(events[-200:]),token))
     c.commit(); c.close(); return {"ok":True}
 
@@ -352,7 +270,7 @@ async def submit(req:Request):
     if not code.strip() and not d.get("auto_submit"):
         raise HTTPException(400,"Coding solution is mandatory")
     score=compute_score(answers,code,tests)
-    c=db(); c.execute(f"""UPDATE sessions SET answers={PH},code={PH},coding_tests={PH},
+    c=db(); c.execute(f"""UPDATE react_sessions SET answers={PH},code={PH},coding_tests={PH},
              score={PH},submitted_at={PH} WHERE token={PH}""",
              (ph_json(answers),code,ph_json(tests),score,now_iso(),token))
     c.commit(); c.close()
