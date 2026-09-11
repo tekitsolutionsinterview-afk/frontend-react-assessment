@@ -1,0 +1,17 @@
+DEPLOYMENT CHECKLIST
+
+1. Extract this ZIP.
+2. In GitHub, replace these exact paths:
+   app/main.py
+   app/static/admin.html
+   app/static/assessment.html
+   requirements.txt
+3. Keep the repository root clean: do NOT put main.py/admin.html/assessment.html at root.
+4. Commit to main.
+5. Render will auto-deploy if Auto Deploy is enabled.
+6. In Render Environment Variables set:
+   ADMIN_PASSWORD = your chosen admin password
+   ADMIN_SECRET = a long random secret
+   DATABASE_URL = your PostgreSQL connection string
+7. Open /admin in a private/incognito window.
+8. Login with ADMIN_PASSWORD.

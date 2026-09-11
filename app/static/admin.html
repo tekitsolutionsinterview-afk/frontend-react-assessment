@@ -1,0 +1,44 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>React Assessment • Admin</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,Arial;background:#07111f;color:#eaf2ff}
+.top{padding:22px 34px;border-bottom:1px solid #1b304b;background:#0a1729;display:flex;justify-content:space-between;align-items:center}
+.brand{font-weight:800;font-size:21px}.pill{font-size:12px;color:#93c5fd}
+.wrap{max-width:1200px;margin:38px auto;padding:0 22px}.card{background:#0d1c30;border:1px solid #1d3552;border-radius:18px;padding:26px;box-shadow:0 18px 50px #0005}
+h1{font-size:30px;margin:0 0 8px}.muted{color:#91a7c0}.row{display:flex;gap:12px;flex-wrap:wrap}input{background:#081525;color:#fff;border:1px solid #29415e;padding:12px 13px;border-radius:10px;min-width:240px}
+button,.report{border:0;border-radius:10px;padding:12px 16px;font-weight:800;cursor:pointer;text-decoration:none;display:inline-block}
+.primary{background:#38bdf8;color:#03111e}.danger{background:#ef4444;color:#fff}.report{background:#22c55e;color:#03210d}
+table{width:100%;border-collapse:collapse;margin-top:24px}th,td{padding:13px 10px;border-bottom:1px solid #1d3552;text-align:left;font-size:14px}th{color:#8fb0d2}
+#app{display:none}.login{max-width:430px;margin:12vh auto}.msg{margin-top:12px;color:#fca5a5;min-height:20px}.creds{margin-top:16px;padding:14px;border:1px dashed #355777;border-radius:12px;display:none}
+</style></head><body>
+<header class="top"><div class="brand">⚡ React Assessment Console</div><div class="pill">ADMIN • PRIVATE</div></header>
+<div id="login" class="wrap login"><div class="card"><h1>Admin Sign In</h1><p class="muted">Manage candidates and download individual assessment reports.</p>
+<input id="pw" type="password" placeholder="Admin password" autocomplete="current-password" style="width:100%;margin-top:16px">
+<button class="primary" style="margin-top:12px" onclick="signin()">Sign in</button><div id="msg" class="msg"></div></div></div>
+<div id="app" class="wrap"><div class="card"><div class="row" style="justify-content:space-between;align-items:center"><div><h1>Candidate Assessments</h1><div class="muted">Create credentials and review submitted attempts.</div></div><button class="danger" onclick="logout()">Sign out</button></div>
+<div style="margin-top:24px"><h3>Create Candidate</h3><div class="row"><input id="name" placeholder="Candidate name"><input id="email" placeholder="Candidate email"><button class="primary" onclick="createCandidate()">Create credentials</button></div><div id="creds" class="creds"></div></div>
+<table><thead><tr><th>Candidate</th><th>Email</th><th>Login</th><th>Score</th><th>Status</th><th>Report</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+<script>
+async function signin(){
+ const msg=document.getElementById('msg'); msg.textContent='Signing in…';
+ try{
+  const r=await fetch('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
+  const d=await r.json().catch(()=>({detail:'Server returned an invalid response'}));
+  if(!r.ok) throw new Error(d.detail||'Login failed');
+  document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';await load();
+ }catch(e){msg.textContent=e.message}
+}
+async function logout(){await fetch('/api/admin/logout',{method:'POST'});location.reload()}
+async function load(){
+ const r=await fetch('/api/admin/sessions'); if(r.status===401){location.reload();return}
+ const data=await r.json(); document.getElementById('rows').innerHTML=data.map(x=>`<tr><td>${esc(x.candidate_name)}</td><td>${esc(x.email)}</td><td>${esc(x.login)}</td><td>${x.score}/100</td><td>${x.submitted_at?'Submitted':'In progress'}</td><td><a class="report" target="_blank" href="/api/admin/session/${encodeURIComponent(x.token)}/report.pdf">📄 PDF Report</a></td></tr>`).join('');
+}
+async function createCandidate(){
+ const r=await fetch('/api/admin/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('name').value,email:document.getElementById('email').value})});
+ const d=await r.json(); if(!r.ok){alert(d.detail||'Failed');return}
+ const c=document.getElementById('creds');c.style.display='block';c.innerHTML=`<b>Login:</b> ${esc(d.login)}<br><b>Password:</b> ${esc(d.password)}<br><small>Copy these credentials now.</small>`;load();
+}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+(async()=>{const r=await fetch('/api/admin/auth');const d=await r.json();if(d.authenticated){document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';load()}})();
+</script></body></html>
