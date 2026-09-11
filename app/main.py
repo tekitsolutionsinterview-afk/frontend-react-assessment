@@ -90,6 +90,9 @@ def init_db():
             submitted_at TEXT,
             score INTEGER DEFAULT 0,
             events JSONB DEFAULT '[]'::jsonb,
+            proctor_events JSONB DEFAULT '[]'::jsonb,
+            violation_count INTEGER DEFAULT 0,
+            camera_granted BOOLEAN DEFAULT FALSE,
             created_at TEXT NOT NULL
         )""")
     else:
@@ -107,8 +110,26 @@ def init_db():
             submitted_at TEXT,
             score INTEGER DEFAULT 0,
             events TEXT DEFAULT '[]',
+            proctor_events TEXT DEFAULT '[]',
+            violation_count INTEGER DEFAULT 0,
+            camera_granted INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
         )""")
+    # Safe additive migration for databases created by earlier versions.
+    migrations = [
+        ("proctor_events", "JSONB DEFAULT '[]'::jsonb" if DB_URL else "TEXT DEFAULT '[]'"),
+        ("violation_count", "INTEGER DEFAULT 0"),
+        ("camera_granted", "BOOLEAN DEFAULT FALSE" if DB_URL else "INTEGER DEFAULT 0"),
+    ]
+    for col, typ in migrations:
+        try:
+            c.execute(f"ALTER TABLE react_sessions ADD COLUMN IF NOT EXISTS {col} {typ}")
+        except Exception:
+            # SQLite versions without IF NOT EXISTS on ADD COLUMN are handled below.
+            try:
+                c.execute(f"ALTER TABLE react_sessions ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
     c.commit(); c.close()
 
 def ph_json(x):
@@ -170,9 +191,9 @@ async def create_candidate(req: Request):
     pwd=secrets.token_urlsafe(6)
     token=secrets.token_urlsafe(18)
     c=db()
-    vals=(name,email,login,hash_pw(pwd),token,ph_json({}),"",ph_json({}),ph_json([]),now_iso())
-    c.execute(f"""INSERT INTO react_sessions(candidate_name,email,login,password_hash,token,answers,code,coding_tests,events,created_at)
-                  VALUES ({','.join([PH]*10)})""", vals)
+    vals=(name,email,login,hash_pw(pwd),token,ph_json({}),"",ph_json({}),ph_json([]),ph_json([]),0,0,now_iso())
+    c.execute(f"""INSERT INTO react_sessions(candidate_name,email,login,password_hash,token,answers,code,coding_tests,events,proctor_events,violation_count,camera_granted,created_at)
+                  VALUES ({','.join([PH]*13)})""", vals)
     c.commit(); c.close()
     return {"login":login,"password":pwd,"token":token}
 
@@ -185,7 +206,7 @@ def admin_sessions(req: Request):
 @app.get("/api/admin/session/{token}")
 def admin_detail(token: str, req: Request):
     require_admin(req); r=get_session(token)
-    for k in ("answers","coding_tests","events"):
+    for k in ("answers","coding_tests","events","proctor_events"):
         if isinstance(r.get(k),str):
             try:r[k]=json.loads(r[k])
             except: r[k]={}
@@ -201,22 +222,40 @@ async def candidate_login(req: Request):
     return {"token":r["token"],"name":r["candidate_name"],"started_at":r["started_at"]}
 
 @app.post("/api/candidate/start/{token}")
-def start(token:str):
+async def start(token:str, req:Request):
     r=get_session(token)
     if r["submitted_at"]: raise HTTPException(409,"Assessment already submitted")
+    data=await req.json() if req.headers.get("content-type","").startswith("application/json") else {}
+    if not bool(data.get("camera_granted")):
+        raise HTTPException(400,"Camera permission is required before starting the assessment")
     if not r["started_at"]:
-        started=now_iso(); c=db(); c.execute(f"UPDATE react_sessions SET started_at={PH} WHERE token={PH}",(started,token)); c.commit(); c.close()
+        started=now_iso(); c=db(); c.execute(f"UPDATE react_sessions SET started_at={PH},camera_granted={PH} WHERE token={PH}",(started,True,token)); c.commit(); c.close()
         return {"started_at":started,"duration_seconds":2700}
+    c=db(); c.execute(f"UPDATE react_sessions SET camera_granted={PH} WHERE token={PH}",(True,token)); c.commit(); c.close()
     return {"started_at":r["started_at"],"duration_seconds":2700}
+
+@app.post("/api/proctor-event")
+async def proctor_event(req:Request):
+    d=await req.json(); token=d.get("token"); r=get_session(token)
+    if r["submitted_at"]: return {"ok":False,"submitted":True}
+    event={"type":str(d.get("type","unknown"))[:80],"detail":str(d.get("detail",""))[:300],"at":now_iso()}
+    existing=r.get("proctor_events") or []
+    if isinstance(existing,str):
+        try: existing=json.loads(existing)
+        except: existing=[]
+    existing=(existing if isinstance(existing,list) else [])[-199:]+[event]
+    violations=int(r.get("violation_count") or 0)+(1 if event["type"] in {"tab_switch","window_blur","fullscreen_exit","camera_revoked","copy_attempt","paste_attempt","cut_attempt","devtools_shortcut"} else 0)
+    c=db(); c.execute(f"UPDATE react_sessions SET proctor_events={PH},violation_count={PH} WHERE token={PH}",(ph_json(existing),violations,token)); c.commit(); c.close()
+    return {"ok":True,"violation_count":violations,"auto_submit":violations>=3}
 
 @app.post("/api/autosave")
 async def autosave(req:Request):
     d=await req.json(); token=d.get("token"); r=get_session(token)
     if r["submitted_at"]: return {"ok":False,"submitted":True}
-    answers=d.get("answers",{}); code=d.get("code",""); events=d.get("events",[])
+    answers=d.get("answers",{}); code=d.get("code",""); events=d.get("events",[]); proctor=d.get("proctor_events",[])
     c=db()
-    c.execute(f"UPDATE react_sessions SET answers={PH},code={PH},events={PH} WHERE token={PH}",
-              (ph_json(answers),code,ph_json(events[-200:]),token))
+    c.execute(f"UPDATE react_sessions SET answers={PH},code={PH},events={PH},proctor_events={PH} WHERE token={PH}",
+              (ph_json(answers),code,ph_json(events[-200:]),ph_json(proctor[-200:]),token))
     c.commit(); c.close(); return {"ok":True}
 
 def score_answer(text):
@@ -233,6 +272,20 @@ def score_answer(text):
     ]
     return min(5, sum(1 for k in concepts[len([]):] if False))  # replaced below
 
+def analyze_code(code):
+    t=(code or "").lower()
+    checks={
+        "uses_timer": "settimeout" in t,
+        "clears_timer": "cleartimeout" in t,
+        "preserves_context": "this" in t,
+        "preserves_arguments": "arguments" in t or "...args" in t,
+        "leading_trailing": "leading" in t and "trailing" in t,
+        "cancel_method": ".cancel" in t or "cancel =" in t,
+        "flush_method": ".flush" in t or "flush =" in t,
+        "single_timer_logic": t.count("settimeout") <= 3 and ("timer" in t or "timeout" in t),
+    }
+    return checks
+
 def compute_score(answers, code, tests):
     keywords = [
       ["event loop","microtask","settimeout"],["closure","let","scope"],["this","bind","arrow"],
@@ -246,15 +299,15 @@ def compute_score(answers, code, tests):
     qscore=0
     for i in range(20):
         t=str(answers.get(f"q{i+1}","")).lower()
+        if not t.strip(): continue
         hits=sum(1 for k in keywords[i] if k in t)
-        qscore += min(5, hits + (1 if len(t.split())>=45 else 0))
-    # Coding is 10 points: 8 functional-ish checks supplied by harness + 2 static checks.
-    code_l=code.lower()
-    coding=min(8, sum(1 for k in ["function","settimeout","clear","this","arguments","cancel","flush","leading","trailing"] if k in code_l))
-    if "test_pass" in tests: coding=min(8,int(tests["test_pass"]))
-    if "cancel" in code_l: coding=min(8,coding+1)
-    if "flush" in code_l: coding=min(8,coding+1)
-    return min(90,qscore)+min(10,coding)
+        qscore += min(4, hits) + (1 if len(t.split())>=45 else 0)
+    qscore=min(90,qscore)
+    # Coding score is question-specific: 8 browser execution checks + 2 source checks.
+    passed=int((tests or {}).get("test_pass",0) or 0)
+    static=analyze_code(code)
+    static_points=sum(1 for k in ("uses_timer","clears_timer","preserves_context","preserves_arguments","leading_trailing","cancel_method","flush_method","single_timer_logic") if static[k])
+    return min(90,qscore)+min(8,passed)+min(2,static_points//4), static
 
 @app.post("/api/submit")
 async def submit(req:Request):
@@ -269,7 +322,8 @@ async def submit(req:Request):
         raise HTTPException(400,"Please answer all mandatory questions before submitting")
     if not code.strip() and not d.get("auto_submit"):
         raise HTTPException(400,"Coding solution is mandatory")
-    score=compute_score(answers,code,tests)
+    score,static_analysis=compute_score(answers,code,tests)
+    tests=dict(tests or {}); tests["server_static"]=static_analysis
     c=db(); c.execute(f"""UPDATE react_sessions SET answers={PH},code={PH},coding_tests={PH},
              score={PH},submitted_at={PH} WHERE token={PH}""",
              (ph_json(answers),code,ph_json(tests),score,now_iso(),token))
@@ -298,7 +352,7 @@ def report(token:str, req:Request):
         data.append([f"Q{i}", "ATTEMPTED" if a else "NOT ATTEMPTED", "—" if not a else "0–5"])
     data.append(["Live Coding","ATTEMPTED" if r["code"].strip() else "NOT ATTEMPTED","0–10"])
     tb=Table(data,colWidths=[90,150,100]); tb.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.5,colors.grey),("BACKGROUND",(0,0),(-1,0),colors.lightgrey),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold")]))
-    story += [tb,Spacer(1,14),Paragraph("Automated screening score is a rubric aid; review answers and code manually before a hiring decision.",st["BodyText"])]
+    story += [tb,Spacer(1,14),Paragraph(f"<b>Proctoring:</b> camera granted: {bool(r.get('camera_granted'))} • policy violations: {int(r.get('violation_count') or 0)}",st["BodyText"]),Spacer(1,8),Paragraph("Automated screening score is a rubric aid; review answers and code manually before a hiring decision.",st["BodyText"])]
     doc.build(story); buf.seek(0)
     return Response(content=buf.read(),media_type="application/pdf",
                     headers={"Content-Disposition":f'inline; filename="react-assessment-{token}.pdf"'})
